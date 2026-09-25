@@ -1,30 +1,38 @@
 # Coolify deployment compose — same stack as docker-compose.selfhost.yml,
 # shaped for Coolify's Docker Compose resource type (deployed via the GitHub
-# App integration).
+# App integration), following the same pattern as sincecommand's compose:
 #
-# Differences from docker-compose.selfhost.yml:
-#   - No host port bindings. Coolify's Traefik proxy routes public domains to
-#     containers over the Docker network; published 127.0.0.1 ports are
-#     unnecessary and only create port-collision risk across stacks.
-#   - Domain labels are examples — set your real domains on each service in
-#     the Coolify UI (Domains field), or edit these before deploying.
-#   - No hard-fail on missing JWT_SECRET at compose-parse time; set it (and
-#     every other secret) under Environment Variables in the Coolify UI.
+#   - Each public-facing service declares SERVICE_FQDN_<SERVICE>_<PORT>.
+#     Coolify reads that and auto-generates a domain for the service (shown
+#     under Domains in the UI) and routes it through its own Traefik — no
+#     manual domain entry, no hand-written traefik labels. Edit the generated
+#     domain in the UI if you want a different hostname, then redeploy.
+#   - Coolify also fills SERVICE_URL_<SERVICE> with the generated URL, so the
+#     stack wires itself: the backend learns the frontend's public address
+#     from SERVICE_URL_FRONTEND and its own from SERVICE_URL_BACKEND.
+#     Nothing to type in.
 #
 # Required environment variables (set in Coolify UI):
 #   JWT_SECRET            openssl rand -hex 32
 #   POSTGRES_PASSWORD     strong random value
-#   FRONTEND_ORIGIN       https://<app-domain>        (no trailing slash)
-#   MULTICA_APP_URL       https://<app-domain>        (no trailing slash)
-#   GOOGLE_REDIRECT_URI   https://<app-domain>/auth/callback
-#   MULTICA_PUBLIC_URL    https://<api-domain>        (webhooks; omit when
-#                         same-origin proxying)
+#   GOOGLE_REDIRECT_URI   https://<app-domain>/auth/callback  (set after the
+#                         domains are generated; the frontend origin itself
+#                         flows in automatically via SERVICE_URL_FRONTEND)
 #
 # Recommended after onboarding: ALLOW_SIGNUP=false, and optionally
 # DISABLE_WORKSPACE_CREATION=true. Set RESEND_API_KEY/RESEND_FROM_EMAIL (or
 # SMTP_*) so login codes are emailed instead of printed to backend logs.
+#
+# No host port bindings anywhere: Coolify's proxy routes over the Docker
+# network, and published 127.0.0.1 ports only create collision risk.
 
 name: multica
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
 
 services:
   postgres:
@@ -45,34 +53,27 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    logging: *logging
 
   backend:
     image: ${MULTICA_BACKEND_IMAGE:-ghcr.io/multica-ai/multica-backend}:${MULTICA_IMAGE_TAG:-latest}
     depends_on:
       postgres:
         condition: service_healthy
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.multica-backend.rule=Host(`multica-api.example.com`)
-      - traefik.http.routers.multica-backend.entrypoints=https
-      - traefik.http.routers.multica-backend.tls.certresolver=letsencrypt
-      - traefik.http.services.multica-backend.loadbalancer.server.port=8080
-    volumes:
-      - backend_uploads:/app/data/uploads
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 120s
     environment:
+      # Declaring this is what makes Coolify generate a domain for the service
+      # and fill SERVICE_URL_BACKEND; the value is the path it routes. Harmless
+      # anywhere else — plain compose just passes the string through.
+      SERVICE_FQDN_BACKEND_8080: /
       DATABASE_URL: postgres://${POSTGRES_USER:-multica}:${POSTGRES_PASSWORD:-multica}@postgres:5432/${POSTGRES_DB:-multica}?sslmode=disable
       DATABASE_SEARCH_WORK_MEM_MB: ${DATABASE_SEARCH_WORK_MEM_MB:-64}
       REDIS_URL: ${REDIS_URL:-}
       REDIS_CLUSTER_MODE: ${REDIS_CLUSTER_MODE:-false}
       PORT: "8080"
       JWT_SECRET: ${JWT_SECRET:-}
-      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
+      # The frontend's public URL, filled by Coolify from its own FQDN var.
+      FRONTEND_ORIGIN: ${SERVICE_URL_FRONTEND:-http://localhost:3000}
+      MULTICA_APP_URL: ${SERVICE_URL_FRONTEND:-http://localhost:3000}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       RESEND_API_KEY: ${RESEND_API_KEY:-}
       RESEND_FROM_EMAIL: ${RESEND_FROM_EMAIL:-noreply@multica.ai}
@@ -86,7 +87,8 @@ services:
       SMTP_EHLO_NAME: ${SMTP_EHLO_NAME:-}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
-      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:3000/auth/callback}
+      # Set after the domains are generated: https://<app-domain>/auth/callback
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
       S3_BUCKET: ${S3_BUCKET:-}
       S3_REGION: ${S3_REGION:-us-west-2}
       AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
@@ -100,7 +102,6 @@ services:
       CLOUDFRONT_PRIVATE_KEY: ${CLOUDFRONT_PRIVATE_KEY:-}
       COOKIE_DOMAIN: ${COOKIE_DOMAIN:-}
       APP_ENV: ${APP_ENV:-production}
-      MULTICA_APP_URL: ${MULTICA_APP_URL:-http://localhost:3000}
       MULTICA_DATABASE_STARTUP_TIMEOUT: ${MULTICA_DATABASE_STARTUP_TIMEOUT:-3m}
       MULTICA_DATABASE_CONNECT_TIMEOUT: ${MULTICA_DATABASE_CONNECT_TIMEOUT:-5s}
       ALLOW_SIGNUP: ${ALLOW_SIGNUP:-true}
@@ -113,7 +114,8 @@ services:
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
-      MULTICA_PUBLIC_URL: ${MULTICA_PUBLIC_URL:-}
+      # The backend's own public URL (webhooks), filled by Coolify.
+      MULTICA_PUBLIC_URL: ${SERVICE_URL_BACKEND:-}
       MULTICA_PLUGIN_SECRET_KEY: ${MULTICA_PLUGIN_SECRET_KEY:-}
       MULTICA_PLUGIN_SURFACE_ORIGIN: ${MULTICA_PLUGIN_SURFACE_ORIGIN:-}
       MULTICA_PLUGIN_API_URL: ${MULTICA_PLUGIN_API_URL:-}
@@ -136,31 +138,39 @@ services:
       MULTICA_WECOM_MEDIA_ALLOW_CIDRS: ${MULTICA_WECOM_MEDIA_ALLOW_CIDRS:-}
       MULTICA_WECOM_TRACE: ${MULTICA_WECOM_TRACE:-}
       MULTICA_TELEGRAM_SECRET_KEY: ${MULTICA_TELEGRAM_SECRET_KEY:-}
+    volumes:
+      - backend_uploads:/app/data/uploads
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
     restart: unless-stopped
+    logging: *logging
 
   frontend:
     image: ${MULTICA_WEB_IMAGE:-ghcr.io/multica-ai/multica-web}:${MULTICA_IMAGE_TAG:-latest}
     depends_on:
       - backend
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.multica-frontend.rule=Host(`multica.example.com`)
-      - traefik.http.routers.multica-frontend.entrypoints=https
-      - traefik.http.routers.multica-frontend.tls.certresolver=letsencrypt
-      - traefik.http.services.multica-frontend.loadbalancer.server.port=3000
+    environment:
+      # Makes Coolify generate the app domain and fill SERVICE_URL_FRONTEND.
+      SERVICE_FQDN_FRONTEND_3000: /
+      HOSTNAME: "0.0.0.0"
+      REMOTE_API_URL: ${REMOTE_API_URL:-http://backend:8080}
+      # Empty lets the frontend same-origin its API/WS through its own domain;
+      # override in the Coolify UI if you split the API onto its own domain.
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-}
+      DOCS_URL: ${DOCS_URL:-}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
       start_period: 60s
-    environment:
-      HOSTNAME: "0.0.0.0"
-      REMOTE_API_URL: ${REMOTE_API_URL:-http://backend:8080}
-      DOCS_URL: ${DOCS_URL:-}
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
-      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-}
     restart: unless-stopped
+    logging: *logging
 
 volumes:
   pgdata:
